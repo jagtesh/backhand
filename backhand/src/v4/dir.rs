@@ -4,7 +4,7 @@
 //! with references back to the inodes that describe those entries.
 
 use std::ffi::OsStr;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use deku::prelude::*;
 
@@ -65,18 +65,42 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    pub fn name(&self) -> Result<&Path, BackhandError> {
+    pub fn name(&self) -> Result<PathBuf, BackhandError> {
         // allow root and nothing else
         if self.name == Component::RootDir.as_os_str().as_bytes() {
-            return Ok(Path::new(Component::RootDir.as_os_str()));
+            return Ok(PathBuf::from(Component::RootDir.as_os_str()));
         }
-        let path = Path::new(OsStr::from_bytes(&self.name));
-        // if not a simple filename, return an error
-        let filename = path.file_name().map(OsStrExt::as_bytes);
-        if filename != Some(&self.name) {
+        
+        // Ensure no actual directory traversal or root anchors in filename
+        if self.name.contains(&b'/') || self.name.contains(&b'\0') || self.name == b"." || self.name == b".." {
             return Err(BackhandError::InvalidFilePath);
         }
-        Ok(path)
+
+        #[cfg(windows)]
+        {
+            let mut s = String::with_capacity(self.name.len());
+            for &b in &self.name {
+                match b {
+                    b'\\' => s.push('\u{F05C}'),
+                    b':' => s.push('\u{F03A}'),
+                    b'*' => s.push('\u{F02A}'),
+                    b'?' => s.push('\u{F03F}'),
+                    b'"' => s.push('\u{F022}'),
+                    b'<' => s.push('\u{F03C}'),
+                    b'>' => s.push('\u{F03E}'),
+                    b'|' => s.push('\u{F07C}'),
+                    c if c < 0x20 => s.push(char::from_u32(0xF000 + c as u32).unwrap_or('\u{FFFD}')),
+                    _ => s.push(b as char), 
+                }
+            }
+            return Ok(PathBuf::from(s));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let path = Path::new(OsStr::from_bytes(&self.name));
+            Ok(PathBuf::from(path))
+        }
     }
 }
 
@@ -114,7 +138,7 @@ mod tests {
             name_size: 0x1,
             name: b"/".to_vec(),
         };
-        assert_eq!(Path::new("/"), dir.name().unwrap());
+        assert_eq!(PathBuf::from("/"), dir.name().unwrap());
 
         // InvalidFilePath
         let dir = DirEntry {
