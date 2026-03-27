@@ -3,8 +3,9 @@
 //! For each directory inode, the directory table stores a linear list of all entries,
 //! with references back to the inodes that describe those entries.
 
+#[allow(unused_imports)]
 use std::ffi::OsStr;
-use std::path::{Component, Path};
+use std::path::{Component, PathBuf};
 
 use deku::prelude::*;
 
@@ -65,68 +66,66 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// Return the filename component of this directory entry as a `Path`.
+    /// Return the filename component of this directory entry as a path.
     ///
-    /// # Upstream fix (this fork)
+    /// # Cross-platform filename handling
     ///
-    /// The original implementation validated the filename using `Path::file_name()`:
+    /// SquashFS is a Linux-native format. Linux filenames can legally contain
+    /// characters that Windows treats specially — most critically, the backslash
+    /// `\` which Windows `Path` interprets as a directory separator.
     ///
-    /// ```rust,ignore
-    /// let path = Path::new(OsStr::from_bytes(&self.name));
-    /// let filename = path.file_name().map(OsStrExt::as_bytes);
-    /// if filename != Some(&self.name) { ... }
-    /// ```
+    /// ## Why PUA mapping is required (not optional)
     ///
-    /// This is correct on Linux, but fails on Windows because the `Path` type is
-    /// host-OS-aware: on Windows, `\` is treated as a directory separator, so a
-    /// Linux filename like `systemd\x2dmute.slice` (a real file inside Ubuntu's
-    /// SquashFS image) is interpreted as a two-component Windows path and
-    /// `file_name()` returns only the last component — causing the validation to
-    /// fail with `BackhandError::InvalidFilePath` even though the filename is
-    /// perfectly valid by SquashFS and POSIX rules.
+    /// backhand internally uses `PathBuf::push(entry.name()?)` / `pop()` in
+    /// `extract_dir()` to build the full path tree. If a filename contains a
+    /// literal `\` (common in Ubuntu SquashFS images — e.g. systemd unit names
+    /// like `systemd\x2dmute.slice`), on Windows:
     ///
-    /// The fix: validate using **raw byte rules** that mirror the SquashFS spec,
-    /// with no host-OS path interpretation at all:
-    /// - `/` is only valid when the entry is the root
-    /// - NUL bytes are never valid in filenames
-    /// - `.` and `..` are not valid directory entry names in SquashFS
+    /// 1. `push` interprets `\` as a path separator → adds **two** components
+    /// 2. `pop` removes only **one** component
+    /// 3. The fullpath drifts, mis-parenting all subsequent entries
     ///
-    /// This approach is consistent with how the Linux kernel and tools like
-    /// `unsquashfs` validate SquashFS directory entries.
+    /// This corrupts the entire directory tree, causing entries from deep
+    /// subdirectories to appear at the root level.
     ///
-    /// # Windows display names (PUA mapping — application concern)
+    /// ## The fix: WSL2-style PUA mapping
     ///
-    /// On Windows, characters like `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|` and
-    /// control characters are illegal in filesystem names (Win32 API restriction).
-    /// A SquashFS image from a Linux system may legally contain these characters.
+    /// On Windows, all characters illegal in Win32 filenames (`\`, `:`, `*`,
+    /// `?`, `"`, `<`, `>`, `|`, and control chars 0x00–0x1F) are mapped to
+    /// their Unicode Private Use Area (PUA) equivalents in U+F000–U+F0FF.
     ///
-    /// **This mapping is intentionally NOT performed here.** It is an
-    /// application-level display concern, not a parsing concern. The consuming
-    /// application (e.g. squashbox-core) is responsible for remapping characters
-    /// when building a Windows-visible directory index. This mirrors the approach
-    /// taken by WSL2: the Windows Subsystem for Linux maps Linux-illegal-on-Windows
-    /// filenames to Unicode Private Use Area (PUA) codepoints in the range
-    /// U+F000–U+F0FF when surfacing them via the Windows filesystem API, keeping
-    /// round-trip fidelity without polluting the parser layer with display policy.
+    /// This is the same strategy used by WSL2 (Windows Subsystem for Linux)
+    /// when surfacing Linux-native filenames through the Windows filesystem
+    /// API. The mapping is:
+    /// - Lossless: each illegal byte maps to a unique PUA codepoint
+    /// - Round-trippable: U+F05C always means "this was a Linux backslash"
+    /// - Safe for PathBuf: PUA codepoints are not path separators
     ///
-    /// # Return type
+    /// References:
+    /// - WSL filesystem interop: https://learn.microsoft.com/en-us/windows/wsl/filesystems
+    /// - PUA range U+F000–U+F0FF in Unicode: https://www.unicode.org/charts/PDF/UF000.pdf
     ///
-    /// Returns `&Path` (a zero-copy view into `self.name`) on all platforms. On
-    /// Windows this is safe as long as the caller does not pass the result to any
-    /// Win32 filesystem API directly — which it should not, since this is a parsed
-    /// in-memory representation of a SquashFS entry, not a host filesystem path.
-    pub fn name(&self) -> Result<&Path, BackhandError> {
+    /// ## Validation
+    ///
+    /// The original upstream code used `Path::file_name()` for validation,
+    /// which is host-OS-aware and fails on Windows for the same reason.
+    /// We validate using raw byte rules matching the SquashFS specification:
+    /// - `/` (forward slash) is only valid as the root entry
+    /// - NUL bytes are never valid
+    /// - `.` and `..` are not valid directory entry names
+    ///
+    /// ## Return type
+    ///
+    /// Returns `PathBuf` on all platforms. On Unix this is a minor allocation
+    /// (one per entry during image parsing). On Windows, the owned `PathBuf`
+    /// is required because we construct a new string with PUA codepoints.
+    pub fn name(&self) -> Result<PathBuf, BackhandError> {
         // Allow root and nothing else as a rooted path
         if self.name == Component::RootDir.as_os_str().as_bytes() {
-            return Ok(Path::new(Component::RootDir.as_os_str()));
+            return Ok(PathBuf::from(Component::RootDir.as_os_str()));
         }
 
         // Validate using raw byte rules — no host-OS Path interpretation.
-        //
-        // This is the key fix: the original code used Path::file_name() which
-        // on Windows treats `\` as a path separator, incorrectly rejecting valid
-        // Linux filenames. We instead check only the properties that SquashFS
-        // itself prohibits.
         if self.name.is_empty()
             || self.name.contains(&b'/')
             || self.name.contains(&b'\0')
@@ -136,16 +135,41 @@ impl DirEntry {
             return Err(BackhandError::InvalidFilePath);
         }
 
-        // Zero-copy: construct a Path view directly over the raw bytes.
-        // On Linux/macOS this is lossless. On Windows, Path will interpret the
-        // bytes as a WTF-8 string; since we have already verified there are no
-        // `/` or `\0` bytes, this is safe for in-memory use. The caller must NOT
-        // pass this path to a Win32 filesystem API — the consuming application
-        // is responsible for PUA-mapping Windows-illegal characters before
-        // creating any OS-visible names.
-        Ok(Path::new(OsStr::from_bytes(&self.name)))
+        // On Windows: map characters illegal in Win32 filenames to Unicode
+        // Private Use Area codepoints (WSL2-compatible mapping).
+        // This is required for correctness, not just display — see doc comment.
+        #[cfg(windows)]
+        {
+            let mut s = String::with_capacity(self.name.len());
+            for &b in &self.name {
+                match b {
+                    b'\\' => s.push('\u{F05C}'), // backslash → PUA (CRITICAL: prevents PathBuf corruption)
+                    b':'  => s.push('\u{F03A}'),
+                    b'*'  => s.push('\u{F02A}'),
+                    b'?'  => s.push('\u{F03F}'),
+                    b'"'  => s.push('\u{F022}'),
+                    b'<'  => s.push('\u{F03C}'),
+                    b'>'  => s.push('\u{F03E}'),
+                    b'|'  => s.push('\u{F07C}'),
+                    c if c < 0x20 => s.push(
+                        char::from_u32(0xF000 + c as u32).unwrap_or('\u{FFFD}')
+                    ),
+                    _ => s.push(b as char),
+                }
+            }
+            return Ok(PathBuf::from(s));
+        }
+
+        // On Unix: zero-copy path from raw bytes. All POSIX-legal bytes are
+        // valid filename characters (only `/` and NUL are forbidden, already
+        // checked above).
+        #[cfg(not(windows))]
+        {
+            Ok(PathBuf::from(OsStr::from_bytes(&self.name)))
+        }
     }
 }
+
 
 
 #[derive(Debug, DekuRead, DekuWrite, Clone, PartialEq, Eq)]
